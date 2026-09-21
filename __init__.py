@@ -1,1 +1,4 @@
-"""Frontend package: Streamlit UI."""
+"""OmniRAG backend package."""
+
+from __future__ import annotations
+

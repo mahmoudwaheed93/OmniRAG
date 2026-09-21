@@ -1,0 +1,384 @@
+"""Fallback router, attempt tracking, and router stats."""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence
+
+from backend.models import (
+    AllProvidersFailedError,
+    ProviderCapabilityError,
+    RateLimitError,
+)
+from backend.utils import get_logger
+
+from backend.providers.llm._types import (
+    FailureClass,
+    LLMMessage,
+    LLMRequestRequirements,
+    LLMResponse,
+    current_llm_operation,
+    current_llm_session_id,
+)
+from backend.providers.llm._classify import classify, describe
+from backend.providers.llm._base import BaseLLMProvider
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ProviderAttempt:
+    """One entry of the failover trail."""
+
+    provider: str
+    model: str
+    outcome: str                      # ok | skipped | failed
+    operation: str = "unspecified"
+    failure_class: Optional[str] = None
+    error_type: Optional[str] = None
+    duration_ms: float = 0.0
+
+    def __str__(self) -> str:
+        if self.outcome == "ok":
+            return f"{self.operation}/{self.provider}: ok ({self.duration_ms:.0f} ms)"
+        if self.outcome == "skipped":
+            return f"{self.operation}/{self.provider}: skipped ({self.failure_class})"
+        return f"{self.operation}/{self.provider}: {self.error_type} [{self.failure_class}]"
+
+
+@dataclass
+class RouterStats:
+    """Lightweight counters powering the UI's provider indicator."""
+
+    calls: int = 0
+    failovers: int = 0
+    by_provider: Dict[str, int] = field(default_factory=dict)
+    last_provider: str = ""
+    last_model: str = ""
+    last_attempts: List[str] = field(default_factory=list)
+
+
+class FallbackLLMProvider(BaseLLMProvider):
+    """Ordered chain of providers presented as a single provider."""
+
+    name = "router"
+
+    def __init__(
+        self,
+        providers: Sequence[BaseLLMProvider],
+        *,
+        enable_fallback: bool = True,
+        rate_limit_cooldown_seconds: float = 60.0,
+        hard_quota_cooldown_seconds: float = 3600.0,
+        clock=time.monotonic,
+        wall_clock=time.time,
+    ):
+        active = [p for p in providers if p is not None]
+        if not active:
+            raise ValueError("FallbackLLMProvider requires at least one provider")
+
+        primary = active[0]
+        super().__init__(
+            model=primary.model,
+            temperature=primary.temperature,
+            max_output_tokens=primary.max_output_tokens,
+        )
+        self.providers: List[BaseLLMProvider] = list(active)
+        self.enable_fallback = enable_fallback and len(self.providers) > 1
+        self.supports_vision = any(p.supports_vision for p in self.providers)
+        self.stats = RouterStats()
+        self._lock = threading.Lock()
+        self.rate_limit_cooldown_seconds = max(0.0, rate_limit_cooldown_seconds)
+        self.hard_quota_cooldown_seconds = max(0.0, hard_quota_cooldown_seconds)
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._rate_limit_cooldowns: Dict[tuple[str, str], float] = {}
+
+    @property
+    def primary(self) -> BaseLLMProvider:
+        return self.providers[0]
+
+    @property
+    def chain(self) -> List[BaseLLMProvider]:
+        return self.providers if self.enable_fallback else self.providers[:1]
+
+    def supports_images(self, model: Optional[str] = None) -> bool:
+        return any(p.supports_images() for p in self.chain)
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "provider": self.name,
+            "model": self.primary.model,
+            "vision": self.supports_vision,
+            "images": self.supports_images(),
+            "chain": [
+                {"provider": p.name, "model": p.model, "images": p.supports_images()}
+                for p in self.chain
+            ],
+            "fallback_enabled": self.enable_fallback,
+        }
+
+    def complete(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+        json_mode: bool = False,
+        requirements: Optional[LLMRequestRequirements] = None,
+    ) -> LLMResponse:
+        needs_images = any(m.has_images for m in messages)
+        operation = current_llm_operation()
+        requirements = requirements or LLMRequestRequirements(
+            requires_text=True,
+            requires_images=needs_images,
+            requires_structured_output=json_mode,
+            operation=operation,
+        )
+        needs_images = requirements.requires_images
+        session_id = current_llm_session_id()
+        attempts: List[ProviderAttempt] = []
+        failures: List[tuple[str, BaseException]] = []
+        capability_error: Optional[ProviderCapabilityError] = None
+        cooldown_failures: List[tuple[str, BaseException]] = []
+
+        for index, provider in enumerate(self.chain):
+            target_model = provider.model_for_request(messages, model)
+            if self._cooldown_active(session_id, provider.name):
+                attempts.append(ProviderAttempt(
+                    provider=provider.name,
+                    model=target_model,
+                    operation=operation,
+                    outcome="skipped",
+                    failure_class="rate_limit_cooldown",
+                ))
+                logger.info(
+                    "LLM operation=%s provider=%s skipped=session_rate_limit_cooldown",
+                    operation,
+                    provider.name,
+                )
+                cooldown_failures.append(
+                    (
+                        provider.name,
+                        RateLimitError(
+                            f"{provider.name} is temporarily skipped after a session rate limit",
+                            provider=provider.name,
+                            quota_exhausted=True,
+                        ),
+                    )
+                )
+                continue
+            if needs_images and not provider.supports_images(target_model):
+                logger.info(
+                    "Skipping %s for a multimodal request: model %s has no image support",
+                    provider.name,
+                    target_model,
+                )
+                attempts.append(
+                    ProviderAttempt(
+                        provider=provider.name,
+                        model=target_model,
+                        operation=operation,
+                        outcome="skipped",
+                        failure_class=FailureClass.CAPABILITY.value,
+                    )
+                )
+                capability_error = ProviderCapabilityError(
+                    f"{provider.name} model '{target_model}' cannot read images",
+                    provider=provider.name,
+                    capability="images",
+                    user_message=(
+                        f"The configured {provider.name} model "
+                        f"`{target_model}` cannot read images, so the visual "
+                        "evidence for this question could not be analysed. Configure a "
+                        "vision-capable model to use OmniRAG's multimodal features."
+                    ),
+                )
+                continue
+
+            started = time.perf_counter()
+            role = "primary" if index == 0 else f"fallback #{index}"
+            logger.info(
+                "LLM operation=%s provider=%s role=%s model=%s%s",
+                operation,
+                provider.name,
+                role,
+                target_model,
+                ", multimodal" if needs_images else "",
+            )
+            try:
+                response = provider.complete(
+                    messages,
+                    system=system,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    model=model,
+                    json_mode=json_mode,
+                    requirements=requirements,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                elapsed = (time.perf_counter() - started) * 1000
+                failure = classify(exc)
+                attempts.append(
+                    ProviderAttempt(
+                        provider=provider.name,
+                        model=target_model,
+                        operation=operation,
+                        outcome="failed",
+                        failure_class=failure.value,
+                        error_type=type(exc).__name__,
+                        duration_ms=elapsed,
+                    )
+                )
+                failures.append((provider.name, exc))
+
+                if isinstance(exc, RateLimitError):
+                    self._start_cooldown(session_id, provider.name, exc)
+
+                logger.warning(
+                    "LLM operation=%s provider=%s model=%s "
+                    "classified_error=%s failure_class=%s",
+                    operation,
+                    provider.name,
+                    target_model,
+                    type(exc).__name__,
+                    failure.value,
+                )
+
+                if failure is not FailureClass.RECOVERABLE:
+                    if len(failures) == 1:
+                        logger.warning(
+                            "%s failed with a non-recoverable error (%s) — not failing over",
+                            provider.name,
+                            describe(exc),
+                        )
+                        raise
+                    logger.error(
+                        "Fallback provider %s failed non-recoverably; preserving %d failures",
+                        provider.name,
+                        len(failures),
+                    )
+                    break
+
+                remaining = len(self.chain) - index - 1
+                logger.warning("%s failed: %s", provider.name, describe(exc))
+                if remaining <= 0:
+                    logger.error("No fallback provider left after %s", provider.name)
+                    break
+                logger.info(
+                    "Switching to %s fallback", self.chain[index + 1].name
+                )
+                continue
+
+            elapsed = (time.perf_counter() - started) * 1000
+            attempts.append(
+                ProviderAttempt(
+                    provider=provider.name,
+                    model=response.model or provider.model,
+                    operation=operation,
+                    outcome="ok",
+                    duration_ms=elapsed,
+                )
+            )
+            logger.info(
+                "LLM operation=%s provider=%s requested_model=%s "
+                "response_model=%s status=ok duration_ms=%.0f",
+                operation,
+                provider.name,
+                target_model,
+                response.model or target_model,
+                elapsed,
+            )
+
+            response.provider = response.provider or provider.name
+            response.fallback_used = response.fallback_used or index > 0
+            response.diagnostics.setdefault("fallback_position", index)
+            response.diagnostics.setdefault("requested_model", target_model)
+            response.diagnostics.setdefault(
+                "response_model", response.model or target_model
+            )
+            response.attempts = [str(a) for a in attempts]
+            self._record(response, failover=index > 0)
+            return response
+
+        failures = [*cooldown_failures, *failures]
+        if capability_error is not None and not failures:
+            raise capability_error
+        if capability_error is not None and failures:
+            failures.append((capability_error.provider or "provider", capability_error))
+        if not failures:
+            raise ProviderCapabilityError(
+                "No configured provider could serve this request",
+                provider=self.name,
+                user_message="No configured AI provider could handle this request.",
+            )
+        raise AllProvidersFailedError(failures)
+
+    def _cooldown_active(self, session_id: str, provider: str) -> bool:
+        if not session_id or (
+            self.rate_limit_cooldown_seconds <= 0
+            and self.hard_quota_cooldown_seconds <= 0
+        ):
+            return False
+        key = (session_id, provider)
+        with self._lock:
+            expiry = self._rate_limit_cooldowns.get(key, 0.0)
+            if expiry <= self._clock():
+                self._rate_limit_cooldowns.pop(key, None)
+                return False
+            return True
+
+    def _start_cooldown(
+        self, session_id: str, provider: str, exc: RateLimitError
+    ) -> None:
+        if not session_id:
+            return
+        duration = self.rate_limit_cooldown_seconds
+        if exc.quota_exhausted:
+            duration = (
+                self._reset_duration(exc.reset_at)
+                or self.hard_quota_cooldown_seconds
+            )
+        elif exc.retry_after is not None:
+            duration = max(duration, float(exc.retry_after))
+        with self._lock:
+            self._rate_limit_cooldowns[(session_id, provider)] = (
+                self._clock() + duration
+            )
+
+    def _reset_duration(self, value: str) -> float:
+        raw = (value or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            numeric = float(raw)
+            if numeric > 10_000_000_000:
+                numeric /= 1000.0
+            if numeric > 1_000_000_000:
+                return max(1.0, numeric - self._wall_clock())
+            return max(1.0, numeric)
+        except ValueError:
+            pass
+        try:
+            reset = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return max(1.0, reset.timestamp() - self._wall_clock())
+        except ValueError:
+            return 0.0
+
+    def _record(self, response: LLMResponse, *, failover: bool) -> None:
+        with self._lock:
+            self.stats.calls += 1
+            if failover:
+                self.stats.failovers += 1
+            provider = response.provider or "unknown"
+            self.stats.by_provider[provider] = self.stats.by_provider.get(provider, 0) + 1
+            self.stats.last_provider = provider
+            self.stats.last_model = response.model
+            self.stats.last_attempts = list(response.attempts)

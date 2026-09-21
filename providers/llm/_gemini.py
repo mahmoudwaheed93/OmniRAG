@@ -1,0 +1,229 @@
+"""Gemini adapter."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
+
+from backend.models import (
+    LLMError,
+    ProviderCapabilityError,
+    ProviderPolicyError,
+    Role,
+)
+from backend.utils import get_logger, to_base64, retry_call
+
+from backend.providers.llm._types import (
+    LLMMessage,
+    LLMRequestRequirements,
+    LLMResponse,
+    current_generation_id,
+)
+from backend.providers.llm._http import post_json
+from backend.providers.llm._base import BaseLLMProvider
+
+logger = get_logger(__name__)
+
+
+class GeminiLLM(BaseLLMProvider):
+    name = "gemini"
+    supports_vision = True
+
+    DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+    DEFAULT_MODEL = "gemini-3.6-flash"
+    POLICY_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
+    _TEXT_ONLY_HINTS = ("embedding", "gemma", "aqa")
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str = "",
+        temperature: float = 0.1,
+        max_output_tokens: int = 1400,
+        timeout_s: float = 90.0,
+        vision_model: str = "",
+        retry_attempts: int = 2,
+    ):
+        super().__init__(
+            model=model or self.DEFAULT_MODEL,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        self.api_key = api_key
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self.timeout_s = timeout_s
+        self.vision_model = vision_model or self.model
+        self.retry_attempts = max(1, retry_attempts)
+
+    def supports_images(self, model: Optional[str] = None) -> bool:
+        target = (model or self.vision_model or self.model).lower()
+        return not any(hint in target for hint in self._TEXT_ONLY_HINTS)
+
+    def model_for_request(
+        self, messages: Sequence[LLMMessage], model: Optional[str] = None
+    ) -> str:
+        return model or (
+            self.vision_model if any(message.has_images for message in messages) else self.model
+        )
+
+    def complete(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+        json_mode: bool = False,
+        requirements: Optional[LLMRequestRequirements] = None,
+    ) -> LLMResponse:
+        has_images = any(m.has_images for m in messages)
+        target_model = self.model_for_request(messages, model)
+
+        generation_config: Dict[str, Any] = {
+            "maxOutputTokens": max_output_tokens or self.max_output_tokens,
+        }
+        if not target_model.startswith(("gemini-3.5-", "gemini-3.6-")):
+            generation_config["temperature"] = (
+                self.temperature if temperature is None else temperature
+            )
+        if json_mode:
+            generation_config["responseMimeType"] = "application/json"
+
+        payload: Dict[str, Any] = {
+            "contents": self._build_contents(messages),
+            "generationConfig": generation_config,
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+
+        if has_images and not self.supports_images(target_model):
+            raise ProviderCapabilityError(
+                f"Gemini model '{target_model}' does not accept image input",
+                provider=self.name,
+                capability="images",
+                user_message=(
+                    f"The configured Gemini model `{target_model}` cannot read images. "
+                    "Set `GEMINI_MODEL` to a multimodal model such as `gemini-3.6-flash`."
+                ),
+            )
+
+        url = f"{self.base_url}/models/{target_model}:generateContent"
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+
+        transport_diagnostics: Dict[str, Any] = {}
+        body = retry_call(
+            lambda: post_json(
+                url,
+                payload,
+                headers=headers,
+                timeout_s=self.timeout_s,
+                provider=self.name,
+                diagnostics=transport_diagnostics,
+            ),
+            attempts=self.retry_attempts,
+            max_delay=2.0,
+            operation=f"gemini/generateContent ({target_model})",
+        )
+        return self._parse(body, target_model, transport_diagnostics)
+
+    def _build_contents(self, messages: Sequence[LLMMessage]) -> List[Dict[str, Any]]:
+        contents: List[Dict[str, Any]] = []
+        for message in messages:
+            if message.role == Role.SYSTEM:
+                continue
+            role = "model" if message.role == Role.ASSISTANT else "user"
+            parts: List[Dict[str, Any]] = []
+            if message.text:
+                parts.append({"text": message.text})
+            for image in message.images:
+                if image.label:
+                    parts.append({"text": image.label})
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": image.media_type or "image/png",
+                            "data": to_base64(image.data),
+                        }
+                    }
+                )
+            contents.append({"role": role, "parts": parts or [{"text": ""}]})
+        return contents or [{"role": "user", "parts": [{"text": ""}]}]
+
+    def _parse(
+        self,
+        body: Dict[str, Any],
+        model: str,
+        transport_diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> LLMResponse:
+        candidates = body.get("candidates") or []
+        if not candidates:
+            blocked = (body.get("promptFeedback") or {}).get("blockReason")
+            if blocked:
+                raise ProviderPolicyError(
+                    f"Gemini blocked the prompt (blockReason={blocked})",
+                    provider=self.name,
+                    reason=str(blocked),
+                    user_message=(
+                        "The model declined to answer this request on safety grounds. "
+                        "Try rephrasing your question."
+                    ),
+                )
+            raise LLMError(
+                "Gemini returned no candidates",
+                provider=self.name,
+                user_message="The model returned an empty answer. Try rephrasing your question.",
+            )
+
+        candidate = candidates[0]
+        finish_reason = str(candidate.get("finishReason") or "")
+        parts = ((candidate.get("content") or {}).get("parts")) or []
+        raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        text = raw_text.strip()
+        usage = body.get("usageMetadata") or {}
+        diagnostics = {
+            **(transport_diagnostics or {}),
+            "provider_raw_chars": len(raw_text),
+            "parsed_chars": len(text),
+            "candidate_count": len(candidates),
+            "content_parts_count": len(parts),
+            "prompt_token_count": usage.get("promptTokenCount"),
+            "candidates_token_count": usage.get("candidatesTokenCount"),
+            "total_token_count": usage.get("totalTokenCount"),
+        }
+        logger.info(
+            "Generation lifecycle stage=provider generation_id=%s provider=gemini "
+            "model=%s finish_reason=%s provider_raw_chars=%d parsed_chars=%d "
+            "candidate_count=%d content_parts_count=%d",
+            current_generation_id(),
+            model,
+            finish_reason or "unspecified",
+            len(raw_text),
+            len(text),
+            len(candidates),
+            len(parts),
+        )
+
+        if not text and finish_reason in self.POLICY_FINISH_REASONS:
+            raise ProviderPolicyError(
+                f"Gemini refused to answer (finishReason={finish_reason})",
+                provider=self.name,
+                reason=finish_reason,
+                user_message="The model declined to answer this request on safety grounds.",
+            )
+        if not text:
+            raise LLMError(
+                f"Empty Gemini completion (finishReason={finish_reason})",
+                provider=self.name,
+                user_message="The model returned an empty answer. Try rephrasing your question.",
+            )
+
+        return LLMResponse(
+            text=text,
+            model=model,
+            finish_reason=finish_reason,
+            usage=usage,
+            provider=self.name,
+            diagnostics=diagnostics,
+        )
